@@ -20,6 +20,15 @@ type RetryParams struct {
 	Delay time.Duration
 }
 
+// RetriesExhaustedParams holds the parameters passed to OnRetriesExhausted.
+type RetriesExhaustedParams struct {
+	// Err is the last error returned by the handler before retries were exhausted.
+	Err error
+	// RetryNum is the total number of attempts performed (1 initial + MaxRetries retries).
+	// For MaxRetries=N this will equal N+1.
+	RetryNum int
+}
+
 // Retry provides a middleware that retries the handler if errors are returned.
 // The retry behaviour is configurable, with exponential backoff and maximum elapsed time.
 type Retry struct {
@@ -42,6 +51,11 @@ type Retry struct {
 	// The number of the current retry is passed as retryNum,
 	OnRetryHook func(retryNum int, delay time.Duration)
 
+	// OnRetriesExhausted is an optional function that will be executed when all retries are exhausted.
+	// This is called when MaxRetries is reached and the handler still returns an error.
+	// It is NOT called when ShouldRetry returns false (that path returns a permanent error and exits earlier).
+	OnRetriesExhausted func(params RetriesExhaustedParams)
+
 	// ShouldRetry is an optional function that will be executed before each retry attempt.
 	// If ShouldRetry returns false, the retry will not be attempted.
 	ShouldRetry func(params RetryParams) bool
@@ -61,6 +75,11 @@ func (r Retry) Middleware(h message.HandlerFunc) message.HandlerFunc {
 	return func(msg *message.Message) ([]*message.Message, error) {
 		originalCtx := msg.Context()
 		retryNum := 0
+		// stoppedByPermanent is set when ShouldRetry returns false, so we know
+		// to skip OnRetriesExhausted — retries weren't actually exhausted, they
+		// were short-circuited. backoff/v5 strips the *PermanentError wrapper
+		// inside Retry, so we can't detect this from the returned error alone.
+		stoppedByPermanent := false
 
 		expBackoff := backoff.NewExponentialBackOff()
 		expBackoff.InitialInterval = r.InitialInterval
@@ -112,6 +131,7 @@ func (r Retry) Middleware(h message.HandlerFunc) message.HandlerFunc {
 					Delay:    expBackoff.NextBackOff(),
 				}) {
 					// backoff.Permanent will stop the retry attempts
+					stoppedByPermanent = true
 					return producedMessages, backoff.Permanent(err)
 				}
 
@@ -138,6 +158,12 @@ func (r Retry) Middleware(h message.HandlerFunc) message.HandlerFunc {
 			return producedMessages, backoffPermanentError.Unwrap()
 		}
 		if retryErr != nil {
+			if r.OnRetriesExhausted != nil && !stoppedByPermanent {
+				r.OnRetriesExhausted(RetriesExhaustedParams{
+					Err:      retryErr,
+					RetryNum: retryNum,
+				})
+			}
 			return producedMessages, retryErr
 		}
 
